@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
-import os
+import json
+import re
 import shutil
 import subprocess
 import sys
@@ -32,9 +33,7 @@ def clear_screen():
 
 
 def get_key():
-    """
-    Read a single key without requiring Enter.
-    """
+    """Read a single key without requiring Enter."""
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
 
@@ -53,9 +52,7 @@ def wait_for_key(message="\nPress any key to continue..."):
 
 
 def run_command(command):
-    """
-    Execute a read-only command and return its stdout.
-    """
+    """Execute a read-only shell command and return stdout, or stderr on failure."""
     try:
         result = subprocess.run(
             command,
@@ -105,25 +102,157 @@ def get_size(path: Path) -> int:
 
 def format_size(size: int) -> str:
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
-
     value = float(size)
 
     for unit in units:
         if value < 1024 or unit == units[-1]:
             return f"{value:.1f} {unit}"
-
         value /= 1024
 
     return f"{value:.1f} TiB"
 
 
+def parse_journal_bytes(output: str) -> int:
+    """Best-effort conversion of journalctl --disk-usage output to bytes."""
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?)(?:i?B|B)", output, re.IGNORECASE)
+    if not match:
+        return 0
+
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    factors = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    return int(value * factors.get(unit, 1))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# UI
+# Machine-readable API for Launcher.qml
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_orphan_packages():
+    try:
+        result = subprocess.run(
+            ["pacman", "-Qtdq"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, FileNotFoundError):
+        return []
+
+    # pacman returns 1 when there are simply no orphan packages.
+    if result.returncode not in (0, 1):
+        return []
+
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def get_status_data():
+    usage = shutil.disk_usage("/")
+    percentage = (usage.used / usage.total) * 100 if usage.total else 0.0
+
+    cache_entries = []
+    total_removable = 0
+    for path in CACHE_DIRS:
+        size = get_size(path)
+        total_removable += size
+        cache_entries.append(
+            {
+                "name": path.name,
+                "path": str(path),
+                "bytes": size,
+                "human": format_size(size),
+            }
+        )
+
+    package_cache_size = get_size(Path("/var/cache/pacman/pkg"))
+    journal_output = run_command("journalctl --disk-usage")
+    journal_bytes = parse_journal_bytes(journal_output)
+    orphans = get_orphan_packages()
+
+    nonzero_names = [entry["name"] for entry in cache_entries if entry["bytes"] > 0]
+    summary = " • ".join(nonzero_names) if nonzero_names else "Nothing to clean"
+
+    return {
+        "disk": {
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "total_human": format_size(usage.total),
+            "used_human": format_size(usage.used),
+            "free_human": format_size(usage.free),
+            "percentage": round(percentage, 1),
+        },
+        "removable_cache": {
+            "total_bytes": total_removable,
+            "total_human": format_size(total_removable),
+            "summary": summary,
+            "entries": cache_entries,
+        },
+        "package_cache": {
+            "bytes": package_cache_size,
+            "human": format_size(package_cache_size),
+        },
+        "journal": {
+            "bytes": journal_bytes,
+            "human": format_size(journal_bytes) if journal_bytes or "0B" in journal_output else (journal_output or "Unknown"),
+            "raw": journal_output,
+        },
+        "orphans": {
+            "count": len(orphans),
+            "packages": orphans,
+        },
+    }
+
+
+def clear_directory_contents(path: Path):
+    failures = []
+
+    if not path.exists():
+        return failures
+
+    for item in path.iterdir():
+        try:
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except OSError as error:
+            failures.append(f"{item}: {error}")
+
+    return failures
+
+
+def clear_configured_caches():
+    before = sum(get_size(path) for path in CACHE_DIRS)
+    failures = []
+
+    for path in CACHE_DIRS:
+        failures.extend(clear_directory_contents(path))
+
+    after = sum(get_size(path) for path in CACHE_DIRS)
+    cleared = max(0, before - after)
+
+    return {
+        "success": len(failures) == 0,
+        "cleared_bytes": cleared,
+        "cleared_human": format_size(cleared),
+        "remaining_bytes": after,
+        "message": f"Cleared approximately {format_size(cleared)}.",
+        "failures": failures,
+    }
+
+
+def print_json(data):
+    # One compact line is intentional: Quickshell's SplitParser consumes it cleanly.
+    print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Terminal UI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_header(title):
     width = 62
-
     print("╭" + "─" * width + "╮")
     print(f"│ {title:^{width - 2}} │")
     print("╰" + "─" * width + "╯")
@@ -134,53 +263,37 @@ def print_section(title):
     print(f"── {title} " + "─" * max(1, 55 - len(title)))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Check storage
-# ─────────────────────────────────────────────────────────────────────────────
-
 def show_disk_usage():
     print_section("Disk")
-
     usage = shutil.disk_usage("/")
-
-    total = usage.total
-    used = usage.used
-    free = usage.free
-
-    percentage = (used / total) * 100
-
-    print(f"Filesystem:     /")
-    print(f"Total:          {format_size(total)}")
-    print(f"Used:           {format_size(used)} ({percentage:.1f}%)")
-    print(f"Available:      {format_size(free)}")
+    percentage = (usage.used / usage.total) * 100
+    print("Filesystem:     /")
+    print(f"Total:          {format_size(usage.total)}")
+    print(f"Used:           {format_size(usage.used)} ({percentage:.1f}%)")
+    print(f"Available:      {format_size(usage.free)}")
 
 
 def show_home_usage():
     print_section("Home directories")
-
     entries = []
 
     try:
         for path in HOME.iterdir():
             if not path.exists():
                 continue
-
             size = get_size(path)
-
             if size > 0:
                 entries.append((size, path))
     except PermissionError:
         pass
 
     entries.sort(reverse=True, key=lambda item: item[0])
-
     for size, path in entries[:15]:
         print(f"{format_size(size):>10}   {path.name}")
 
 
 def show_cache_usage():
     print_section("Largest caches")
-
     cache_root = HOME / ".cache"
 
     if not cache_root.exists():
@@ -188,79 +301,53 @@ def show_cache_usage():
         return
 
     entries = []
-
     for path in cache_root.iterdir():
         try:
-            size = get_size(path)
-            entries.append((size, path))
+            entries.append((get_size(path), path))
         except OSError:
             pass
 
     entries.sort(reverse=True, key=lambda item: item[0])
-
     for size, path in entries[:15]:
         print(f"{format_size(size):>10}   {path.name}")
 
-    total = get_size(cache_root)
-
     print()
-    print(f"{'Total cache:':>15} {format_size(total)}")
+    print(f"{'Total cache:':>15} {format_size(get_size(cache_root))}")
 
 
 def show_package_cache():
     print_section("Pacman package cache")
-
     cache_path = Path("/var/cache/pacman/pkg")
-
-    size = get_size(cache_path)
-
-    print(f"/var/cache/pacman/pkg: {format_size(size)}")
+    print(f"/var/cache/pacman/pkg: {format_size(get_size(cache_path))}")
 
 
 def show_journal_usage():
     print_section("System journal")
-
     output = run_command("journalctl --disk-usage")
-
-    if output:
-        print(output)
-    else:
-        print("Unable to determine journal size.")
+    print(output if output else "Unable to determine journal size.")
 
 
 def show_orphans():
     print_section("Orphan packages")
+    packages = get_orphan_packages()
 
-    output = run_command("pacman -Qtdq")
-
-    if not output:
+    if not packages:
         print("No orphan packages found.")
         return
 
-    packages = [
-        line.strip()
-        for line in output.splitlines()
-        if line.strip()
-    ]
-
     print(f"Found: {len(packages)}")
     print()
-
     for package in packages:
         print(f"  • {package}")
 
 
 def check_storage():
     clear_screen()
-
     print_header("CachyOS Storage Check")
-
     print("\nScanning filesystem...")
 
-    # Move cursor back and redraw cleanly after scanning.
     clear_screen()
     print_header("CachyOS Storage Check")
-
     show_disk_usage()
     show_home_usage()
     show_cache_usage()
@@ -271,42 +358,18 @@ def check_storage():
     print()
     print("─" * 64)
     print("Read-only scan complete.")
-
     wait_for_key()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Clear cache
-# ─────────────────────────────────────────────────────────────────────────────
-
-def clear_directory_contents(path: Path):
-    if not path.exists():
-        return
-
-    for item in path.iterdir():
-        try:
-            if item.is_dir() and not item.is_symlink():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-
-        except OSError as error:
-            print(f"  Failed to remove {item}: {error}")
 
 
 def clear_cache():
     clear_screen()
-
     print_header("Clear Cache")
 
     total_size = 0
-
     print()
-
     for path in CACHE_DIRS:
         size = get_size(path)
         total_size += size
-
         print(f"{format_size(size):>10}   {path}")
 
     print()
@@ -319,9 +382,7 @@ def clear_cache():
         return
 
     print("\nClear these caches? [y/N] ", end="", flush=True)
-
     answer = get_key().lower()
-
     print(answer)
 
     if answer != "y":
@@ -329,35 +390,23 @@ def clear_cache():
         wait_for_key()
         return
 
-    print()
-
-    for path in CACHE_DIRS:
-        size_before = get_size(path)
-
-        print(
-            f"Clearing {path.name:<12} "
-            f"({format_size(size_before)})..."
-        )
-
-        clear_directory_contents(path)
-
+    result = clear_configured_caches()
     print()
     print("─" * 64)
-    print(f"Done. Approximately {format_size(total_size)} cleared.")
+    print(result["message"])
+
+    if result["failures"]:
+        print("\nSome entries could not be removed:")
+        for failure in result["failures"]:
+            print(f"  • {failure}")
 
     wait_for_key()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main menu
-# ─────────────────────────────────────────────────────────────────────────────
-
 def show_menu():
     while True:
         clear_screen()
-
         print_header("CachyOS Cleanup")
-
         print()
         print("  [1]  Check storage")
         print("  [2]  Clear Cache")
@@ -367,13 +416,10 @@ def show_menu():
         print("Select an option: ", end="", flush=True)
 
         choice = get_key()
-
         if choice == "1":
             check_storage()
-
         elif choice == "2":
             clear_cache()
-
         elif choice == "0":
             clear_screen()
             break
@@ -383,10 +429,24 @@ def show_menu():
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
+    if "--status-json" in sys.argv:
+        print_json(get_status_data())
+        return 0
+
+    if "--clear-cache-json" in sys.argv:
+        result = clear_configured_caches()
+        print_json(result)
+        return 0 if result["success"] else 1
+
     try:
         show_menu()
-
+        return 0
     except KeyboardInterrupt:
         clear_screen()
         print("Cleanup cancelled.")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
