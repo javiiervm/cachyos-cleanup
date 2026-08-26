@@ -1,6 +1,6 @@
 <div align="center">
 
-# CachyOS Cleanup
+# CachyOS Cleanup 🧹
 
 **A lightweight interactive storage and cache cleanup utility for CachyOS and Arch Linux.**
 
