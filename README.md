@@ -5,10 +5,10 @@
 **A lightweight interactive storage and cache cleanup utility for CachyOS and Arch Linux.**
 
 <p>
-  <img src="https://img.shields.io/github/last-commit/javiiervm/CachyOS-Cleanup/main" alt="Last Commit" />
+  <img src="https://img.shields.io/github/last-commit/javiiervm/cachyos-cleanup/main" alt="Last Commit" />
   <img src="https://img.shields.io/badge/platform-linux-lightgrey" alt="Platform Support" />
-  <img src="https://img.shields.io/github/issues/javiiervm/CachyOS-Cleanup" alt="Issues" />
-  <img src="https://img.shields.io/github/stars/javiiervm/CachyOS-Cleanup" alt="Stars" />
+  <img src="https://img.shields.io/github/issues/javiiervm/cachyos-cleanup" alt="Issues" />
+  <img src="https://img.shields.io/github/stars/javiiervm/cachyos-cleanup" alt="Stars" />
   <br />
   <img src="https://img.shields.io/badge/python-3.10%2B-yellow?logo=python" alt="Python Version" />
   <img src="https://img.shields.io/badge/CachyOS-supported-blue" alt="CachyOS" />
