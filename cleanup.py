@@ -114,7 +114,9 @@ def format_size(size: int) -> str:
 
 def parse_journal_bytes(output: str) -> int:
     """Best-effort conversion of journalctl --disk-usage output to bytes."""
-    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?)(?:i?B|B)", output, re.IGNORECASE)
+    # systemd commonly prints values such as "49.6M" rather than "49.6MB".
+    # Accept both forms so the QML UI always receives a short formatted value.
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?)(?:i?B|B)?", output, re.IGNORECASE)
     if not match:
         return 0
 
